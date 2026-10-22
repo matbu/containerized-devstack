@@ -1,0 +1,85 @@
+# DevStack local.conf TEMPLATE for containerized-devstack (isolated model).
+# Rendered by scripts/container-stack.sh with envsubst (${VARS} come from
+# config.env, passed into the container as environment variables).
+#
+# Design:
+#   * The whole DevStack control plane AND libvirt run in THIS container.
+#   * nova uses the container's own libvirtd with KVM -> VMs run on the host's
+#     hardware virtualization (/dev/kvm). cpu_mode=host-passthrough for speed.
+#   * Neutron uses DevStack's default ML2/OVN, kept entirely inside the
+#     container's own network namespace (the container is NOT --network host),
+#     so it stays isolated from the host network.
+#   * Persistent data lives under DevStack's native /opt/stack/data, which is
+#     bind-mounted from the host (so the bytes live on the host and all DevStack
+#     path assumptions - venv, instances, images - stay consistent).
+
+[[local|localrc]]
+
+# (Ubuntu 24.04 ships Python 3.12 natively, so no PYTHON3_VERSION override.)
+
+# ---- Credentials -----------------------------------------------------------
+ADMIN_PASSWORD=${ADMIN_PASSWORD}
+DATABASE_PASSWORD=${ADMIN_PASSWORD}
+RABBIT_PASSWORD=${ADMIN_PASSWORD}
+SERVICE_PASSWORD=${ADMIN_PASSWORD}
+
+# ---- Host / bind addresses (the container's fixed podman-net IP) ------------
+HOST_IP=${CONTAINER_IP}
+SERVICE_HOST=${CONTAINER_IP}
+
+# ---- Readiness robustness ---------------------------------------------------
+# On loaded hosts services can take longer than the default 60s to become ready.
+# Raise the readiness timeout to avoid false "X did not start" failures (e.g.
+# g-api) during stack.sh.
+SERVICE_TIMEOUT=300
+
+# ---- Persistent storage on the host (/home) --------------------------------
+# DATA_DIR defaults to /opt/stack/data, which is bind-mounted from the host.
+LOGFILE=/opt/stack/data/logs/stack.sh.log
+LOG_COLOR=False
+VERBOSE=True
+
+# ---- Services --------------------------------------------------------------
+# Lean set: identity, image, compute, network (OVN), placement, volume, horizon.
+disable_service tempest
+disable_service swift
+
+# ---- Neutron: DevStack default (ML2/OVN), isolated in this container's netns -
+# Tenant networks use geneve overlays (OVN). Set the type explicitly so
+# tenant_network_types is populated (otherwise neutron can't allocate a segment:
+# "No project network is available for allocation").
+Q_ML2_TENANT_NETWORK_TYPE=geneve
+
+# Addressing (ranges chosen to not clash with the host once a route is added).
+FIXED_RANGE=${FIXED_RANGE}
+FLOATING_RANGE=${FLOATING_RANGE}
+PUBLIC_NETWORK_GATEWAY=${FLOATING_GW}
+Q_FLOATING_ALLOCATION_POOL=start=${FLOATING_POOL_START},end=${FLOATING_POOL_END}
+IP_VERSION=4
+
+# ---- Compute: KVM on the host hardware -------------------------------------
+LIBVIRT_TYPE=kvm
+
+# ---- Cinder: NFS backend ----------------------------------------------------
+# iSCSI (the LVM default) can't work here: iscsid can't reach the kernel iSCSI
+# netlink from the container's isolated netns. NFS attaches by mounting a share
+# (no netlink), so it works. The NFS server runs in the container (set up by
+# scripts/container-stack.sh) and exports a dir on the host-backed /opt/stack/data.
+CINDER_ENABLED_BACKENDS=nfs:nfs
+CINDER_NFS_SERVERPATH=127.0.0.1:/opt/stack/data/cinder-nfs
+
+# ===========================================================================
+# post-config
+# ===========================================================================
+# Compute (nova-compute reads nova-cpu.conf): host-passthrough CPU + NFS v3
+# mount options (the loopback export only serves NFSv3 cleanly).
+[[post-config|\$NOVA_CPU_CONF]]
+[libvirt]
+cpu_mode = host-passthrough
+images_type = qcow2
+nfs_mount_options = vers=3
+
+# NOTE: the cinder [nfs] section (nas_secure_*, nfs_mount_options) and the
+# default_volume_type are set post-stack by scripts/container-stack.sh, because
+# DevStack's nfs backend setup runs AFTER local.conf post-config and overwrites
+# that section (leaving nas_secure_* empty, which the NfsDriver rejects).
