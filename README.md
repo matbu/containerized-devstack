@@ -69,7 +69,25 @@ Everything is tunable in [`config.env`](./config.env).
 ./run.sh nuke           # remove everything incl. data + network + route
 ```
 
-Set the target host with `LAB_HOST` (e.g. `make all LAB_HOST=root@myhost`).
+### Remote or local
+
+The same commands work whether you drive a remote host over SSH or run directly
+on the target machine:
+
+```bash
+# Remote (over ssh) — the default:
+LAB_HOST=root@myhost ./run.sh all       # or: make all LAB_HOST=root@myhost
+
+# Local — on this machine, or when you're already logged into the server:
+LAB_HOST=local ./run.sh all             # or: PDS_LOCAL=1 ./run.sh all
+```
+
+(You can also set `LAB_HOST` once in `config.env`.)
+
+In local mode there's no ssh/rsync: podman, systemctl and networking run
+directly, and `sync` is a no-op when you run from the project directory. Local
+mode needs privileges for podman/systemctl/ip (run as root or with rootful
+podman). The host must be Linux with `/dev/kvm` (KVM is required for the VMs).
 
 ### Reaching the dashboard / APIs
 
