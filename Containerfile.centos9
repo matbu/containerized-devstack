@@ -1,0 +1,68 @@
+# containerized-devstack — CentOS Stream 9 base.
+#
+# Use this base where Ubuntu's apt mirrors aren't reachable but CentOS/RDO/PyPI
+# are (e.g. the OCP/KubeVirt environment). Pinned to RDO Epoxy (stable/2025.1),
+# which has matching el9 packages on the CentOS Cloud SIG mirror.
+#
+# Build:  BASE=centos9 ./run.sh build
+FROM quay.io/centos/centos:stream9
+
+ARG DEVSTACK_BRANCH=stable/2025.1
+ENV container=podman
+
+# dnf tuning: on restricted networks (e.g. the OCP/KubeVirt egress) most of the
+# random community mirrors in CentOS's mirrorlist are unreachable and dnf burns
+# ~30s per dead mirror, crawling at ~1kB/s. fastestmirror ranks mirrors by speed
+# so the fast official mirror (mirror.stream.centos.org) wins and dead ones fail
+# fast — this takes stack.sh's package phase from "days" to seconds there.
+RUN printf '%s\n' \
+        'fastestmirror=True' \
+        'max_parallel_downloads=10' \
+        'timeout=10' \
+        'retries=10' \
+        'minrate=100' \
+        'ip_resolve=4' >> /etc/dnf/dnf.conf
+
+# Base tooling DevStack assumes + Python 3.12 (CS9 default is 3.9, whose
+# importlib.metadata can't resolve modern underscore dist-info names) + libvirt
+# client libs + an in-container NFS server (for the Cinder NFS backend).
+# libvirt-devel lives in CRB; enable it for this install.
+RUN dnf -y install --setopt=install_weak_deps=False --enablerepo=crb \
+        systemd systemd-sysv \
+        sudo git which procps-ng iproute iputils hostname \
+        iptables ebtables conntrack-tools \
+        glibc-langpack-en libselinux-utils \
+        python3 python3-pip python3-devel \
+        python3.12 python3.12-devel python3.12-pip \
+        gcc make redhat-rpm-config pkgconf-pkg-config \
+        libvirt-libs libvirt-client libvirt-devel qemu-img \
+        nfs-utils rpcbind \
+        openssh-clients rsync gettext \
+    && dnf clean all && rm -rf /var/cache/dnf
+
+ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+
+# Trim systemd units that make no sense in a container.
+RUN systemctl mask \
+        dev-hugepages.mount sys-fs-fuse-connections.mount \
+        systemd-logind.service getty.target console-getty.service \
+        systemd-udevd.service systemd-udev-trigger.service \
+    || true
+
+# DevStack refuses to run as root; create the conventional 'stack' user.
+RUN useradd -s /bin/bash -d /opt/stack -m stack \
+    && chmod 0755 /opt/stack \
+    && echo "stack ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/stack \
+    && chmod 440 /etc/sudoers.d/stack
+
+RUN git clone --depth 1 --branch "${DEVSTACK_BRANCH}" \
+        https://opendev.org/openstack/devstack /opt/stack/devstack \
+    && chown -R stack:stack /opt/stack
+
+COPY local.conf.tmpl /opt/stack/local.conf.tmpl
+COPY scripts/ovn-wait.inc /opt/stack/ovn-wait.inc
+COPY scripts/container-stack.sh /usr/local/bin/container-stack.sh
+RUN chmod +x /usr/local/bin/container-stack.sh
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

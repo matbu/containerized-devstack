@@ -71,8 +71,8 @@ do_prep() {
 }
 
 do_build() {
-    echo ">> building image ${IMAGE} (branch ${DEVSTACK_BRANCH})"
-    host_run "cd '${REMOTE_DIR}' && podman build --build-arg DEVSTACK_BRANCH='${DEVSTACK_BRANCH}' -t '${IMAGE}' -f Containerfile ."
+    echo ">> building image ${IMAGE} (base ${BASE}, ${CONTAINERFILE}, branch ${DEVSTACK_BRANCH})"
+    host_run "cd '${REMOTE_DIR}' && podman build --build-arg DEVSTACK_BRANCH='${DEVSTACK_BRANCH}' -t '${IMAGE}' -f '${CONTAINERFILE}' ."
 }
 
 do_up() {
@@ -139,14 +139,16 @@ do_info() {
 }
 
 do_push() {
-    echo ">> pushing ${IMAGE} to ${REGISTRY_IMAGE}:{${REGISTRY_TAG},latest} (needs: podman login on the host)"
+    # Moving tag per base: ubuntu -> :latest, centos9 -> :centos9
+    local moving; [ "$BASE" = "centos9" ] && moving="centos9" || moving="latest"
+    echo ">> pushing ${IMAGE} to ${REGISTRY_IMAGE}:{${REGISTRY_TAG},${moving}} (needs: podman login on the host)"
     host_script <<EOF
 set -e
 podman tag '${IMAGE}' '${REGISTRY_IMAGE}:${REGISTRY_TAG}'
-podman tag '${IMAGE}' '${REGISTRY_IMAGE}:latest'
+podman tag '${IMAGE}' '${REGISTRY_IMAGE}:${moving}'
 podman push '${REGISTRY_IMAGE}:${REGISTRY_TAG}'
-podman push '${REGISTRY_IMAGE}:latest'
-echo "pushed ${REGISTRY_IMAGE}:${REGISTRY_TAG} and :latest"
+podman push '${REGISTRY_IMAGE}:${moving}'
+echo "pushed ${REGISTRY_IMAGE}:${REGISTRY_TAG} and :${moving}"
 EOF
 }
 

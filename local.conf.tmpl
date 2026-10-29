@@ -15,7 +15,15 @@
 
 [[local|localrc]]
 
-# (Ubuntu 24.04 ships Python 3.12 natively, so no PYTHON3_VERSION override.)
+# ---- Python ----------------------------------------------------------------
+# Use 3.12 on both bases. Ubuntu 24.04 ships it natively; on CentOS Stream 9 the
+# default is 3.9 (whose importlib.metadata can't resolve modern underscore
+# dist-info names, breaking oslo-config-generator), so we install & select 3.12.
+PYTHON3_VERSION=3.12
+# Install OpenStack into a dedicated venv (/opt/stack/data/venv). DevStack
+# defaults this True on Ubuntu but FALSE on CentOS Stream 9 — without it, el9
+# installs into system Python (wrong-version uwsgi, broken console-script paths).
+GLOBAL_VENV=True
 
 # ---- Credentials -----------------------------------------------------------
 ADMIN_PASSWORD=${ADMIN_PASSWORD}
@@ -49,6 +57,14 @@ disable_service swift
 # tenant_network_types is populated (otherwise neutron can't allocate a segment:
 # "No project network is available for allocation").
 Q_ML2_TENANT_NETWORK_TYPE=geneve
+
+# MTU: when this runs as a VM on an OVN-Kubernetes cluster, instance traffic is
+# double-encapsulated (OpenStack geneve inside the cluster's geneve). DevStack
+# would otherwise assume a 1500 physnet and give tenant networks MTU 1442, which
+# is too big for the cluster overlay — large TLS packets (e.g. to pypi/Fastly)
+# get silently dropped and pip/dnf "read timed out". Tell neutron the physical
+# MTU is 1458 so geneve tenant networks land at 1400 (1458 - 58 overhead).
+GLOBAL_PHYSNET_MTU=1458
 
 # Addressing (ranges chosen to not clash with the host once a route is added).
 FIXED_RANGE=${FIXED_RANGE}
