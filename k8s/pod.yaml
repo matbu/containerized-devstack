@@ -1,0 +1,67 @@
+# Run containerized-devstack as a PRIVILEGED POD (direct container on the node).
+#
+# This is the "no nesting" variant: the DevStack container runs straight on the
+# node's kernel, so nova guests are L1 qemu/KVM (fast). It needs a permissive
+# cluster that allows privileged pods + systemd + /dev/kvm — e.g. k3s or vanilla
+# k8s. It will NOT be admitted on OpenShift with the restricted SCC (use the
+# KubeVirt VM variant, k8s/virtualmachine.yaml, there instead).
+#
+# Deploy (k3s on the host):
+#   KUBECONFIG=/etc/rancher/k3s/k3s.yaml k3s kubectl apply -f k8s/pod.yaml
+#   # wait until systemd is up, then run the stacker:
+#   k3s kubectl -n devstack exec devstack -- /usr/local/bin/container-stack.sh
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: devstack
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: devstack
+  namespace: devstack
+  labels: { app: devstack }
+spec:
+  hostname: devstack
+  restartPolicy: Never
+  containers:
+    - name: devstack
+      image: quay.io/os-migrate/devstack:latest
+      imagePullPolicy: IfNotPresent
+      command: ["/lib/systemd/systemd"]          # boot systemd as PID 1
+      securityContext:
+        privileged: true                          # host devices (/dev/kvm), caps, cgroup
+      env:
+        - name: CONTAINER_IP                       # DevStack binds its APIs here
+          valueFrom: { fieldRef: { fieldPath: status.podIP } }
+        - name: ADMIN_PASSWORD
+          value: secretadmin
+        - name: FIXED_RANGE
+          value: 10.11.0.0/24
+        - name: FLOATING_RANGE
+          value: 172.40.0.0/24
+        - name: FLOATING_GW
+          value: 172.40.0.1
+        - name: FLOATING_POOL_START
+          value: 172.40.0.100
+        - name: FLOATING_POOL_END
+          value: 172.40.0.200
+        - name: HORIZON_PORT
+          value: "80"
+      volumeMounts:
+        - { name: cgroup, mountPath: /sys/fs/cgroup }   # systemd needs cgroup rw
+        - { name: run,    mountPath: /run }             # tmpfs for systemd
+        - { name: tmp,    mountPath: /tmp }
+        - { name: data,   mountPath: /opt/stack/data }  # persistent data on the node
+        - { name: kvm,    mountPath: /dev/kvm }
+  volumes:
+    - name: cgroup
+      hostPath: { path: /sys/fs/cgroup }
+    - name: run
+      emptyDir: { medium: Memory }
+    - name: tmp
+      emptyDir: {}
+    - name: data
+      hostPath: { path: /home/k3s-devstack-data, type: DirectoryOrCreate }
+    - name: kvm
+      hostPath: { path: /dev/kvm }

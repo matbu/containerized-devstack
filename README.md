@@ -129,6 +129,12 @@ They run on the host's KVM; their disks live under the host data dir
   enablers are handled automatically: nova/cinder `nfs_mount_options = vers=3`
   (the loopback export only serves v3 cleanly) and libvirt
   `qemu.conf namespaces = []` (so qemu sees nova's live NFS mounts).
+* **Nested virtualization**: nova guests run with `cpu_mode=host-passthrough` so
+  they expose the host's `vmx`/`svm` and get `/dev/kvm` — needed when a guest is
+  itself a hypervisor/conversion host (e.g. running virt-v2v/libguestfs, which
+  otherwise falls back to slow TCG). DevStack's default (`custom`/Nehalem) strips
+  those flags, so the stacker forces host-passthrough post-stack. Size such
+  conversion-host guests with enough RAM for the libguestfs appliance (>= ~4 GB).
 * nova reports the host's full CPU/RAM as capacity — fine for dev/test, not for
   production scheduling.
 * Re-run `./run.sh prep` + `./run.sh route` after a host reboot (the podman

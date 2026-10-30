@@ -1,0 +1,81 @@
+# Run containerized-devstack inside a KubeVirt VirtualMachine.
+#
+# Why a VM and not a plain Pod: DevStack needs a privileged, systemd container
+# with /dev/kvm and its own OVN/OVS. On a restricted cluster you usually can't
+# run such a Pod (no privileged SCC), but you CAN create a KubeVirt VM. The VM
+# gives a full kernel + nested /dev/kvm + root + systemd; inside it we run this
+# project's image in "local" mode via podman. The qemu guests DevStack boots are
+# nested KVM inside this VM (host-passthrough CPU enables that).
+#
+# Apply:   oc apply -f k8s/cloudinit-secret.yaml      # cloud-init (add your SSH key here)
+#          oc apply -f k8s/virtualmachine.yaml
+# Console: virtctl console containerized-devstack
+# Progress: (in the VM)  tail -f /var/log/devstack-deploy.log
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: containerized-devstack
+  labels:
+    app: containerized-devstack
+spec:
+  runStrategy: Always
+  dataVolumeTemplates:
+    - metadata:
+        name: containerized-devstack-root
+      spec:
+        sourceRef:
+          kind: DataSource
+          name: centos-stream9
+          namespace: openshift-virtualization-os-images
+        storage:
+          resources:
+            requests:
+              storage: 100Gi
+  template:
+    metadata:
+      labels:
+        kubevirt.io/domain: containerized-devstack
+    spec:
+      architecture: amd64
+      domain:
+        # Sized to the namespace LimitRange cap (max 4 CPU / 16Gi per pod).
+        # Pod memory = guest + ~0.5Gi KubeVirt overhead, so guest 14Gi stays
+        # safely under the 16Gi pod cap. Enough for the DevStack control plane +
+        # a 4GB conversion host + a couple of small CI VMs.
+        cpu:
+          cores: 4
+          sockets: 1
+          threads: 1
+          model: host-passthrough      # exposes VMX -> nested KVM for DevStack guests
+        memory:
+          guest: 14Gi
+        resources:
+          requests: { cpu: "4", memory: 14Gi }
+          limits:   { cpu: "4", memory: 14Gi }
+        devices:
+          disks:
+            - name: rootdisk
+              disk: { bus: virtio }
+            - name: cloudinitdisk
+              disk: { bus: virtio }
+          interfaces:
+            - name: default
+              masquerade: {}
+              model: virtio
+          networkInterfaceMultiqueue: true
+          rng: {}
+        machine:
+          type: pc-q35-rhel9.4.0
+      networks:
+        - name: default
+          pod: {}
+      volumes:
+        - name: rootdisk
+          dataVolume:
+            name: containerized-devstack-root
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+            # cloud-init lives in the Secret (k8s/cloudinit-secret.yaml) so it can
+            # exceed the 2048-byte inline limit and carry your SSH key.
+            secretRef:
+              name: containerized-devstack-cloudinit

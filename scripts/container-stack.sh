@@ -75,9 +75,10 @@ setup_nfs_server() {
     echo "/opt/stack/data/cinder-nfs 127.0.0.1(rw,sync,no_root_squash,no_subtree_check)" > /etc/exports
     systemctl enable --now rpcbind 2>/dev/null || true
     systemctl enable rpc-statd 2>/dev/null || true
-    systemctl restart nfs-server 2>/dev/null || true
+    # service name differs: nfs-server (CentOS/RHEL) vs nfs-kernel-server (Ubuntu)
+    systemctl restart nfs-server 2>/dev/null || systemctl restart nfs-kernel-server 2>/dev/null || true
     exportfs -ra 2>/dev/null || true
-    echo "[container-stack] in-container NFS server: $(systemctl is-active nfs-server 2>/dev/null)"
+    echo "[container-stack] in-container NFS server: $(systemctl is-active nfs-server nfs-kernel-server 2>/dev/null | grep -m1 active || echo inactive)"
 }
 setup_nfs_server
 
@@ -108,13 +109,50 @@ fi
 run_stack() { su - stack -c 'cd /opt/stack/devstack && ./stack.sh'; }
 mysql_count() { mysql -uroot -p"${ADMIN_PASSWORD}" -N -e "$1" 2>/dev/null || echo 0; }
 
+ensure_venv_uwsgi() {
+    # el9 installs the uwsgi RPM (Python 3.9), but DevStack runs services as
+    # '/usr/sbin/uwsgi --venv <py3.12 venv>' -> the 3.9 uwsgi can't import the
+    # 3.12 modules ("No module named 'keystone'" -> HTTP 500). Build a py3.12
+    # uwsgi into the venv and point /usr/sbin/uwsgi at it. (On Ubuntu the system
+    # uwsgi is already 3.12, so this is a no-op there.)
+    local vbin="${DATA}/venv/bin"
+    [ -x "${vbin}/pip" ] || return 0
+    if ! "${vbin}/python" -c 'import sys,subprocess' 2>/dev/null; then return 0; fi
+    # already consistent? (system uwsgi links the venv python version)
+    if [ -x "${vbin}/uwsgi" ] && [ "$(readlink -f /usr/sbin/uwsgi 2>/dev/null)" = "$(readlink -f ${vbin}/uwsgi)" ]; then
+        return 0
+    fi
+    [ -x "${vbin}/uwsgi" ] || su - stack -c "${vbin}/pip install --quiet uwsgi" 2>/dev/null || "${vbin}/pip" install --quiet uwsgi 2>/dev/null || true
+    if [ -x "${vbin}/uwsgi" ]; then
+        ln -sf "${vbin}/uwsgi" /usr/sbin/uwsgi
+        echo "[container-stack] uwsgi -> venv py3.12 build (/usr/sbin/uwsgi)"
+    fi
+}
+
+ensure_venv_libvirt_python() {
+    # On el9, DevStack provides the libvirt python binding via the python3-libvirt
+    # RPM (system py3.9), so nova-compute in the py3.12 venv fails with
+    # "No module named 'libvirt'". Build the matching libvirt-python into the venv.
+    # (On Ubuntu it's already pip-installed into the venv, so this is a no-op.)
+    local vbin="${DATA}/venv/bin"
+    [ -x "${vbin}/python" ] || return 0
+    "${vbin}/python" -c 'import libvirt' 2>/dev/null && return 0
+    local lv
+    lv=$( { libvirtd --version 2>/dev/null || /usr/sbin/libvirtd --version 2>/dev/null; } | awk '{print $NF}')
+    su - stack -c "${vbin}/pip install --quiet libvirt-python${lv:+==$lv}" 2>/dev/null \
+      || su - stack -c "${vbin}/pip install --quiet libvirt-python" 2>/dev/null || true
+    "${vbin}/python" -c 'import libvirt' 2>/dev/null && echo "[container-stack] installed libvirt-python into venv"
+}
+
 heal_services() {
     echo "[container-stack] healing flaky API services (busy-host restart)..."
-    systemctl restart \
-        devstack@neutron-api devstack@g-api devstack@placement-api \
-        devstack@n-api devstack@n-api-meta devstack@n-super-cond \
-        devstack@n-cond-cell1 devstack@n-sch devstack@n-cpu \
-        devstack@c-api devstack@c-vol 2>/dev/null || true
+    ensure_venv_uwsgi
+    ensure_venv_libvirt_python
+    # neutron server unit: neutron-api (newer) or q-svc (Epoxy); restart both
+    for s in neutron-api q-svc g-api placement-api n-api n-api-meta \
+             n-super-cond n-cond-cell1 n-sch n-cpu c-api c-vol keystone; do
+        systemctl restart "devstack@$s" 2>/dev/null || true
+    done
     # Wait for OVN to be ready (geneve pool synced + live hash-ring node).
     for i in $(seq 1 40); do
         local g r
@@ -129,6 +167,23 @@ discover_hosts() {
     # Map the compute host into the cell so nova can schedule (idempotent).
     [ -x "${VBIN}/nova-manage" ] || return 0
     su - stack -c "cd /opt/stack/devstack && source openrc admin admin >/dev/null 2>&1; ${VBIN}/nova-manage cell_v2 discover_hosts --verbose" 2>&1 | tail -2 || true
+}
+
+nova_nested_kvm_finalize() {
+    # DevStack defaults nova-compute to cpu_mode=custom + cpu_models=Nehalem,
+    # which strips vmx/svm from guests -> no NESTED KVM -> anything inside a guest
+    # that needs KVM (e.g. a virt-v2v/libguestfs appliance on a conversion host)
+    # falls back to slow TCG. Force host-passthrough so guests see the host CPU
+    # (with virt flags) and get /dev/kvm. (post-config is overridden by DevStack's
+    # default, so enforce it here, post-stack.)
+    local f=/etc/nova/nova-cpu.conf
+    [ -f "$f" ] || return 0
+    if ! grep -q '^cpu_mode = host-passthrough' "$f"; then
+        sed -ri 's/^cpu_mode *=.*/cpu_mode = host-passthrough/; s/^(cpu_models? *=.*)/#\1/' "$f"
+        grep -q '^cpu_mode' "$f" || printf '\n[libvirt]\ncpu_mode = host-passthrough\n' >> "$f"
+        systemctl restart devstack@n-cpu 2>/dev/null || true
+        echo "[container-stack] nova cpu_mode=host-passthrough (nested KVM for guests)"
+    fi
 }
 
 libvirt_namespaces_finalize() {
@@ -176,6 +231,7 @@ echo "[container-stack] ensuring compute host is discovered..."
 discover_hosts
 libvirt_namespaces_finalize
 cinder_nfs_finalize
+nova_nested_kvm_finalize
 
 echo "[container-stack] DONE."
 echo "[container-stack] KVM domains (run on the host's /dev/kvm):"
